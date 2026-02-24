@@ -1,0 +1,30 @@
+# Cloudflare Workers Configuration
+# Documentation: https://developers.cloudflare.com/workers/wrangler/configuration/
+
+name = "worker-subscription-converter"
+main = "worker_to_sub.js"
+compatibility_date = "2024-01-01"
+
+# Worker settings
+[build]
+command = ""
+
+# Environment variables (optional)
+[vars]
+# DEBUG = "false"
+
+# Development configuration
+[env.dev]
+name = "worker-subscription-converter-dev"
+
+# Production configuration
+[env.production]
+name = "worker-subscription-converter"
+routes = [
+  # Add your custom domain routes here
+  # { pattern = "sub.example.com/*", zone_name = "example.com" }
+]
+
+# Cron triggers (optional - for periodic tasks)
+# [triggers]
+# crons = ["0 */6 * * *"]  # Run every 6 hours

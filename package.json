@@ -1,0 +1,34 @@
+{
+  "name": "worker-subscription-converter",
+  "version": "2.0.0",
+  "description": "High-quality Cloudflare Workers script for converting proxy subscriptions to Clash/Surge format with IPv6 support",
+  "main": "worker_to_sub.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:dev": "wrangler deploy --env dev",
+    "deploy:prod": "wrangler deploy --env production",
+    "tail": "wrangler tail",
+    "test": "echo \"No tests specified yet\""
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "subscription-converter",
+    "clash",
+    "surge",
+    "vmess",
+    "vless",
+    "trojan",
+    "shadowsocks",
+    "ipv6",
+    "proxy"
+  ],
+  "author": "RixGem",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
