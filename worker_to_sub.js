@@ -1,841 +1,357 @@
 /**
- * Cloudflare Workers Subscription Converter
- * 
- * This worker converts various proxy subscription formats to Clash/Surge format
- * with support for IPv6 node detection and proper error handling.
- * 
- * Supported Input Formats:
- * - VMess (vmess://)
- * - VLESS (vless://)
- * - Trojan (trojan://)
- * - Shadowsocks (ss://)
- * - ShadowsocksR (ssr://)
- * 
- * Supported Output Formats:
- * - Clash (YAML)
- * - Surge (configuration)
- * 
- * @author RixGem
- * @version 2.0.0
+ * Cloudflare Worker - Optimized IP Subscription Generator
+ * Fetches best Cloudflare IPs with HKG/SIN prioritization
+ * Supports IPv4/IPv6 dual stack with performance-based sorting
  */
 
-// ==================== Configuration ====================
-
-const CONFIG = {
-  // Default target format if not specified
-  DEFAULT_TARGET: 'clash',
-  
-  // Maximum subscription fetch timeout (ms)
-  FETCH_TIMEOUT: 10000,
-  
-  // Enable debug logging
-  DEBUG: false,
-  
-  // IPv6 detection patterns
-  IPV6_PATTERNS: [
-    /\[([0-9a-fA-F:]+)\]/,  // Bracketed IPv6: [2001:db8::1]
-    /^([0-9a-fA-F]{0,4}:){7}[0-9a-fA-F]{0,4}$/  // Pure IPv6
-  ],
-  
-  // Node name suffix for IPv6 nodes
-  IPV6_SUFFIX: '-v6',
-  
-  // Clash template
-  CLASH_TEMPLATE: {
-    port: 7890,
-    'socks-port': 7891,
-    'allow-lan': true,
-    mode: 'rule',
-    'log-level': 'info',
-    'external-controller': '0.0.0.0:9090',
-    dns: {
-      enable: true,
-      nameserver: ['223.5.5.5', '1.1.1.1'],
-      fallback: ['8.8.8.8', '1.0.0.1']
-    }
-  }
+const API_URL = 'https://api.4ce.cn/api/bestCFIP';
+const PRIORITY_REGIONS = ['HKG', 'SIN'];
+const OPERATOR_MAP = {
+  '移动': 'CM',
+  '联通': 'CU',
+  '电信': 'CT'
 };
-
-// ==================== Utility Functions ====================
-
-/**
- * Logger utility with debug mode support
- */
-const Logger = {
-  debug: (...args) => CONFIG.DEBUG && console.log('[DEBUG]', ...args),
-  info: (...args) => console.log('[INFO]', ...args),
-  warn: (...args) => console.warn('[WARN]', ...args),
-  error: (...args) => console.error('[ERROR]', ...args)
-};
-
-/**
- * Base64 encoding/decoding utilities
- * Handles both standard and URL-safe base64
- */
-const Base64 = {
-  /**
-   * Decode base64 string (supports both standard and URL-safe)
-   * @param {string} str - Base64 encoded string
-   * @returns {string} Decoded string
-   */
-  decode: (str) => {
-    try {
-      // Replace URL-safe characters
-      str = str.replace(/-/g, '+').replace(/_/g, '/');
-      
-      // Add padding if needed
-      while (str.length % 4) {
-        str += '=';
-      }
-      
-      return atob(str);
-    } catch (e) {
-      Logger.error('Base64 decode error:', e.message);
-      throw new Error('Invalid base64 string');
-    }
-  },
-  
-  /**
-   * Encode string to base64
-   * @param {string} str - String to encode
-   * @returns {string} Base64 encoded string
-   */
-  encode: (str) => {
-    try {
-      return btoa(str);
-    } catch (e) {
-      Logger.error('Base64 encode error:', e.message);
-      throw new Error('Base64 encoding failed');
-    }
-  },
-  
-  /**
-   * Encode to URL-safe base64
-   * @param {string} str - String to encode
-   * @returns {string} URL-safe base64 string
-   */
-  encodeUrlSafe: (str) => {
-    return Base64.encode(str)
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=/g, '');
-  }
-};
-
-/**
- * Check if an address is IPv6
- * @param {string} address - IP address or hostname
- * @returns {boolean} True if IPv6
- */
-function isIPv6(address) {
-  if (!address) return false;
-  
-  return CONFIG.IPV6_PATTERNS.some(pattern => pattern.test(address));
-}
-
-/**
- * Sanitize and format node name
- * @param {string} name - Original node name
- * @param {boolean} isV6 - Whether this is an IPv6 node
- * @returns {string} Formatted name
- */
-function formatNodeName(name, isV6 = false) {
-  if (!name) return 'Unnamed Node';
-  
-  // Remove special characters and trim
-  let formatted = name.trim().replace(/[\r\n\t]/g, '');
-  
-  // Add IPv6 suffix if needed and not already present
-  if (isV6 && !formatted.includes(CONFIG.IPV6_SUFFIX)) {
-    formatted += ` ${CONFIG.IPV6_SUFFIX}`;
-  }
-  
-  return formatted;
-}
-
-/**
- * Fetch content from URL with timeout
- * @param {string} url - URL to fetch
- * @returns {Promise<string>} Response text
- */
-async function fetchWithTimeout(url) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT);
-  
-  try {
-    const response = await fetch(url, { 
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'ClashForWindows/0.20.39'
-      }
-    });
-    
-    clearTimeout(timeoutId);
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    
-    return await response.text();
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      throw new Error('Request timeout');
-    }
-    throw error;
-  }
-}
-
-// ==================== Proxy Parsers ====================
-
-/**
- * Parse VMess protocol
- * Format: vmess://base64(json)
- */
-function parseVMess(url) {
-  try {
-    const content = url.replace('vmess://', '');
-    const decoded = Base64.decode(content);
-    const config = JSON.parse(decoded);
-    
-    const isV6 = isIPv6(config.add);
-    
-    return {
-      type: 'vmess',
-      name: formatNodeName(config.ps || config.name, isV6),
-      server: config.add,
-      port: parseInt(config.port) || 443,
-      uuid: config.id,
-      alterId: parseInt(config.aid) || 0,
-      cipher: config.scy || 'auto',
-      tls: config.tls === 'tls',
-      network: config.net || 'tcp',
-      'ws-opts': config.net === 'ws' ? {
-        path: config.path || '/',
-        headers: config.host ? { Host: config.host } : {}
-      } : undefined,
-      'h2-opts': config.net === 'h2' ? {
-        host: config.host ? [config.host] : [],
-        path: config.path || '/'
-      } : undefined,
-      'grpc-opts': config.net === 'grpc' ? {
-        'grpc-service-name': config.path || ''
-      } : undefined,
-      sni: config.sni || config.host,
-      'skip-cert-verify': config.verify_cert === false,
-      isIPv6: isV6
-    };
-  } catch (e) {
-    Logger.warn('VMess parse error:', e.message);
-    return null;
-  }
-}
-
-/**
- * Parse VLESS protocol
- * Format: vless://uuid@host:port?params#name
- */
-function parseVLESS(url) {
-  try {
-    const urlObj = new URL(url);
-    const server = urlObj.hostname;
-    const isV6 = isIPv6(server);
-    
-    return {
-      type: 'vless',
-      name: formatNodeName(decodeURIComponent(urlObj.hash.slice(1)), isV6),
-      server: server,
-      port: parseInt(urlObj.port) || 443,
-      uuid: urlObj.username,
-      flow: urlObj.searchParams.get('flow') || '',
-      network: urlObj.searchParams.get('type') || 'tcp',
-      tls: urlObj.searchParams.get('security') === 'tls',
-      sni: urlObj.searchParams.get('sni') || '',
-      'skip-cert-verify': urlObj.searchParams.get('allowInsecure') === '1',
-      'ws-opts': urlObj.searchParams.get('type') === 'ws' ? {
-        path: urlObj.searchParams.get('path') || '/',
-        headers: urlObj.searchParams.get('host') ? 
-          { Host: urlObj.searchParams.get('host') } : {}
-      } : undefined,
-      isIPv6: isV6
-    };
-  } catch (e) {
-    Logger.warn('VLESS parse error:', e.message);
-    return null;
-  }
-}
-
-/**
- * Parse Trojan protocol
- * Format: trojan://password@host:port?params#name
- */
-function parseTrojan(url) {
-  try {
-    const urlObj = new URL(url);
-    const server = urlObj.hostname;
-    const isV6 = isIPv6(server);
-    
-    return {
-      type: 'trojan',
-      name: formatNodeName(decodeURIComponent(urlObj.hash.slice(1)), isV6),
-      server: server,
-      port: parseInt(urlObj.port) || 443,
-      password: urlObj.username,
-      sni: urlObj.searchParams.get('sni') || server,
-      'skip-cert-verify': urlObj.searchParams.get('allowInsecure') === '1',
-      network: urlObj.searchParams.get('type') || 'tcp',
-      'ws-opts': urlObj.searchParams.get('type') === 'ws' ? {
-        path: urlObj.searchParams.get('path') || '/',
-        headers: urlObj.searchParams.get('host') ? 
-          { Host: urlObj.searchParams.get('host') } : {}
-      } : undefined,
-      isIPv6: isV6
-    };
-  } catch (e) {
-    Logger.warn('Trojan parse error:', e.message);
-    return null;
-  }
-}
-
-/**
- * Parse Shadowsocks protocol
- * Format: ss://base64(method:password)@host:port#name
- */
-function parseShadowsocks(url) {
-  try {
-    let content = url.replace('ss://', '');
-    let name = '';
-    
-    // Extract name if present
-    if (content.includes('#')) {
-      [content, name] = content.split('#');
-      name = decodeURIComponent(name);
-    }
-    
-    // Try to parse modern format first
-    if (content.includes('@')) {
-      const [userInfo, serverInfo] = content.split('@');
-      const decoded = Base64.decode(userInfo);
-      const [method, password] = decoded.split(':');
-      const [server, port] = serverInfo.split(':');
-      const isV6 = isIPv6(server);
-      
-      return {
-        type: 'ss',
-        name: formatNodeName(name || 'SS Node', isV6),
-        server: server,
-        port: parseInt(port) || 8388,
-        cipher: method,
-        password: password,
-        isIPv6: isV6
-      };
-    } else {
-      // Legacy format: ss://base64(all)
-      const decoded = Base64.decode(content);
-      const parts = decoded.match(/^(.+?):(.+)@(.+?):(\d+)$/);
-      
-      if (parts) {
-        const isV6 = isIPv6(parts[3]);
-        return {
-          type: 'ss',
-          name: formatNodeName(name || 'SS Node', isV6),
-          server: parts[3],
-          port: parseInt(parts[4]) || 8388,
-          cipher: parts[1],
-          password: parts[2],
-          isIPv6: isV6
-        };
-      }
-    }
-  } catch (e) {
-    Logger.warn('Shadowsocks parse error:', e.message);
-  }
-  return null;
-}
-
-/**
- * Parse ShadowsocksR protocol
- * Format: ssr://base64(params)
- */
-function parseShadowsocksR(url) {
-  try {
-    const content = url.replace('ssr://', '');
-    const decoded = Base64.decode(content);
-    
-    // SSR format: server:port:protocol:method:obfs:base64(password)/?params
-    const mainPart = decoded.split('/?')[0];
-    const params = decoded.split('/?')[1] || '';
-    const parts = mainPart.split(':');
-    
-    if (parts.length < 6) return null;
-    
-    const server = parts[0];
-    const isV6 = isIPv6(server);
-    const paramObj = {};
-    
-    // Parse URL parameters
-    params.split('&').forEach(param => {
-      const [key, value] = param.split('=');
-      if (key && value) {
-        paramObj[key] = Base64.decode(value);
-      }
-    });
-    
-    return {
-      type: 'ssr',
-      name: formatNodeName(paramObj.remarks || 'SSR Node', isV6),
-      server: server,
-      port: parseInt(parts[1]) || 8388,
-      protocol: parts[2],
-      cipher: parts[3],
-      obfs: parts[4],
-      password: Base64.decode(parts[5]),
-      'protocol-param': paramObj.protoparam || '',
-      'obfs-param': paramObj.obfsparam || '',
-      isIPv6: isV6
-    };
-  } catch (e) {
-    Logger.warn('ShadowsocksR parse error:', e.message);
-    return null;
-  }
-}
-
-/**
- * Main proxy parser - detects type and calls appropriate parser
- */
-function parseProxy(url) {
-  if (!url || typeof url !== 'string') return null;
-  
-  url = url.trim();
-  
-  if (url.startsWith('vmess://')) return parseVMess(url);
-  if (url.startsWith('vless://')) return parseVLESS(url);
-  if (url.startsWith('trojan://')) return parseTrojan(url);
-  if (url.startsWith('ss://')) return parseShadowsocks(url);
-  if (url.startsWith('ssr://')) return parseShadowsocksR(url);
-  
-  Logger.debug('Unknown proxy protocol:', url.substring(0, 20));
-  return null;
-}
-
-// ==================== Format Converters ====================
-
-/**
- * Convert proxy node to Clash format
- */
-function toClashProxy(proxy) {
-  if (!proxy) return null;
-  
-  const base = {
-    name: proxy.name,
-    type: proxy.type,
-    server: proxy.server,
-    port: proxy.port
-  };
-  
-  // Remove undefined values
-  const cleaned = JSON.parse(JSON.stringify(base));
-  
-  // Add type-specific fields
-  Object.keys(proxy).forEach(key => {
-    if (!['type', 'name', 'server', 'port', 'isIPv6'].includes(key) && 
-        proxy[key] !== undefined) {
-      cleaned[key] = proxy[key];
-    }
-  });
-  
-  return cleaned;
-}
-
-/**
- * Convert proxy node to Surge format
- */
-function toSurgeProxy(proxy) {
-  if (!proxy) return null;
-  
-  let line = `${proxy.name} = ${proxy.type}, ${proxy.server}, ${proxy.port}`;
-  
-  switch (proxy.type) {
-    case 'vmess':
-    case 'vless':
-      line += `, username=${proxy.uuid}`;
-      if (proxy.tls) line += ', tls=true';
-      if (proxy.sni) line += `, sni=${proxy.sni}`;
-      if (proxy['skip-cert-verify']) line += ', skip-cert-verify=true';
-      break;
-      
-    case 'trojan':
-      line += `, password=${proxy.password}`;
-      if (proxy.sni) line += `, sni=${proxy.sni}`;
-      if (proxy['skip-cert-verify']) line += ', skip-cert-verify=true';
-      break;
-      
-    case 'ss':
-      line += `, encrypt-method=${proxy.cipher}, password=${proxy.password}`;
-      break;
-  }
-  
-  return line;
-}
-
-/**
- * Generate Clash configuration YAML
- */
-function generateClashConfig(proxies) {
-  const config = { ...CONFIG.CLASH_TEMPLATE };
-  config.proxies = proxies.map(p => toClashProxy(p)).filter(Boolean);
-  
-  // Add proxy groups
-  const proxyNames = config.proxies.map(p => p.name);
-  config['proxy-groups'] = [
-    {
-      name: 'Proxy',
-      type: 'select',
-      proxies: ['Auto', 'DIRECT', ...proxyNames]
-    },
-    {
-      name: 'Auto',
-      type: 'url-test',
-      proxies: proxyNames,
-      url: 'http://www.gstatic.com/generate_204',
-      interval: 300
-    }
-  ];
-  
-  // Add basic rules
-  config.rules = [
-    'DOMAIN-SUFFIX,google.com,Proxy',
-    'DOMAIN-KEYWORD,google,Proxy',
-    'GEOIP,CN,DIRECT',
-    'MATCH,Proxy'
-  ];
-  
-  // Convert to YAML format (simplified)
-  return JSON.stringify(config, null, 2)
-    .replace(/"/g, '')
-    .replace(/,\n/g, '\n');
-}
-
-/**
- * Generate Surge configuration
- */
-function generateSurgeConfig(proxies) {
-  const lines = [
-    '#!MANAGED-CONFIG interval=86400 strict=false',
-    '',
-    '[General]',
-    'loglevel = notify',
-    'skip-proxy = 127.0.0.1, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, localhost, *.local',
-    'dns-server = system, 223.5.5.5, 1.1.1.1',
-    '',
-    '[Proxy]',
-    ...proxies.map(p => toSurgeProxy(p)).filter(Boolean),
-    '',
-    '[Proxy Group]',
-    `Proxy = select, ${proxies.map(p => p.name).join(', ')}`,
-    '',
-    '[Rule]',
-    'DOMAIN-SUFFIX,google.com,Proxy',
-    'GEOIP,CN,DIRECT',
-    'FINAL,Proxy'
-  ];
-  
-  return lines.join('\n');
-}
-
-// ==================== Main Handler ====================
 
 /**
  * Main request handler
  */
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
+
 async function handleRequest(request) {
-  const url = new URL(request.url);
-  
-  // Get parameters
-  const target = url.searchParams.get('target') || CONFIG.DEFAULT_TARGET;
-  const subUrls = url.searchParams.getAll('url');
-  
-  // Handle root path - show usage
-  if (url.pathname === '/') {
-    return new Response(getUsagePage(), {
-      headers: { 'Content-Type': 'text/html; charset=utf-8' }
-    });
-  }
-  
-  // Validate parameters
-  if (subUrls.length === 0) {
-    return new Response(
-      JSON.stringify({ 
-        error: 'No subscription URLs provided',
-        usage: 'Add ?url=YOUR_SUBSCRIPTION_URL'
-      }), 
-      { 
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      }
-    );
-  }
-  
   try {
-    Logger.info(`Processing ${subUrls.length} subscription(s) for target: ${target}`);
+    const url = new URL(request.url);
+    const format = url.searchParams.get('format') || 'v2ray';
     
-    // Fetch all subscriptions
-    const fetchPromises = subUrls.map(async (subUrl) => {
-      try {
-        const content = await fetchWithTimeout(subUrl);
-        return content;
-      } catch (e) {
-        Logger.error(`Failed to fetch ${subUrl}:`, e.message);
-        return '';
-      }
-    });
+    // Fetch and process IPs
+    const preferredIps = await getPreferredIps();
     
-    const contents = await Promise.all(fetchPromises);
-    
-    // Parse all proxy URLs
-    const allProxies = [];
-    
-    for (const content of contents) {
-      if (!content) continue;
-      
-      // Try to decode if base64
-      let decoded = content;
-      try {
-        decoded = Base64.decode(content);
-      } catch (e) {
-        // Not base64, use as-is
-      }
-      
-      // Split by lines and parse each
-      const lines = decoded.split(/\r?\n/);
-      for (const line of lines) {
-        const proxy = parseProxy(line);
-        if (proxy) {
-          allProxies.push(proxy);
-        }
-      }
-    }
-    
-    Logger.info(`Successfully parsed ${allProxies.length} proxies`);
-    
-    // Log IPv6 statistics
-    const ipv6Count = allProxies.filter(p => p.isIPv6).length;
-    if (ipv6Count > 0) {
-      Logger.info(`Found ${ipv6Count} IPv6 nodes`);
-    }
-    
-    if (allProxies.length === 0) {
-      return new Response(
-        JSON.stringify({ 
-          error: 'No valid proxies found',
-          message: 'Check your subscription URLs'
-        }), 
-        { 
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        }
-      );
-    }
-    
-    // Generate output based on target format
-    let output, contentType;
-    
-    switch (target.toLowerCase()) {
+    // Generate subscription based on format
+    let response;
+    switch (format.toLowerCase()) {
       case 'clash':
-        output = generateClashConfig(allProxies);
-        contentType = 'application/x-yaml; charset=utf-8';
+        response = generateClashSubscription(preferredIps);
         break;
-        
       case 'surge':
-        output = generateSurgeConfig(allProxies);
-        contentType = 'text/plain; charset=utf-8';
+        response = generateSurgeSubscription(preferredIps);
         break;
-        
-      case 'json':
-        output = JSON.stringify(allProxies, null, 2);
-        contentType = 'application/json; charset=utf-8';
-        break;
-        
+      case 'v2ray':
       default:
-        return new Response(
-          JSON.stringify({ 
-            error: 'Invalid target format',
-            supported: ['clash', 'surge', 'json']
-          }), 
-          { 
-            status: 400,
-            headers: { 'Content-Type': 'application/json' }
-          }
-        );
+        response = generateV2raySubscription(preferredIps);
+        break;
     }
     
-    return new Response(output, {
+    return new Response(response, {
       headers: {
-        'Content-Type': contentType,
-        'Cache-Control': 'public, max-age=3600',
-        'Access-Control-Allow-Origin': '*'
+        'Content-Type': 'text/plain;charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=300'
       }
     });
-    
   } catch (error) {
-    Logger.error('Request handling error:', error.message);
-    
-    return new Response(
-      JSON.stringify({ 
-        error: 'Internal server error',
-        message: error.message
-      }), 
-      { 
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      }
-    );
+    return new Response(`Error: ${error.message}`, { 
+      status: 500,
+      headers: { 'Content-Type': 'text/plain' }
+    });
   }
 }
 
 /**
- * Generate usage page HTML
+ * Fetch and process preferred IPs from API
+ * Returns sorted array with priority: HKG/SIN optimized > Operator IPs > Backup IPs
  */
-function getUsagePage() {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Subscription Converter</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      max-width: 800px;
-      margin: 50px auto;
-      padding: 20px;
-      line-height: 1.6;
-      background: #f5f5f5;
+async function getPreferredIps() {
+  try {
+    const response = await fetch(API_URL, {
+      headers: {
+        'User-Agent': 'Cloudflare-Worker/1.0'
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`API returned status ${response.status}`);
     }
-    .container {
-      background: white;
-      padding: 30px;
-      border-radius: 10px;
-      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    
+    const data = await response.json();
+    
+    if (!Array.isArray(data)) {
+      throw new Error('Invalid API response format');
     }
-    h1 {
-      color: #333;
-      border-bottom: 3px solid #4CAF50;
-      padding-bottom: 10px;
-    }
-    .feature {
-      background: #e8f5e9;
-      padding: 15px;
-      margin: 15px 0;
-      border-radius: 5px;
-      border-left: 4px solid #4CAF50;
-    }
-    code {
-      background: #f4f4f4;
-      padding: 2px 6px;
-      border-radius: 3px;
-      font-family: 'Courier New', monospace;
-    }
-    .endpoint {
-      background: #fff3e0;
-      padding: 15px;
-      margin: 10px 0;
-      border-radius: 5px;
-      border-left: 4px solid #ff9800;
-    }
-    .example {
-      background: #e3f2fd;
-      padding: 15px;
-      margin: 10px 0;
-      border-radius: 5px;
-      overflow-x: auto;
-    }
-    .warning {
-      background: #fff3cd;
-      padding: 15px;
-      margin: 15px 0;
-      border-radius: 5px;
-      border-left: 4px solid #ffc107;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>🔄 Subscription Converter API</h1>
     
-    <p>Convert various proxy subscription formats to Clash or Surge configuration.</p>
+    // Process and categorize IPs
+    const processed = data.map(entry => processIPEntry(entry));
+    const categorized = categorizeIPs(processed);
     
-    <div class="feature">
-      <h3>✨ Features</h3>
-      <ul>
-        <li>✅ Supports VMess, VLESS, Trojan, SS, SSR protocols</li>
-        <li>✅ Automatic IPv6 node detection and labeling</li>
-        <li>✅ Multiple subscription URL merging</li>
-        <li>✅ Clash and Surge format output</li>
-        <li>✅ Fast and reliable on Cloudflare Workers</li>
-      </ul>
-    </div>
+    // Sort within each category
+    categorized.priorityRegions.sort(comparePerformance);
+    categorized.operatorIPs.sort(comparePerformance);
+    categorized.backupIPs.sort(comparePerformance);
     
-    <h2>📡 API Endpoints</h2>
-    
-    <div class="endpoint">
-      <h3>Convert Subscription</h3>
-      <code>GET /?url=SUBSCRIPTION_URL&target=FORMAT</code>
-    </div>
-    
-    <h3>Parameters:</h3>
-    <ul>
-      <li><code>url</code> - Subscription URL (can be used multiple times)</li>
-      <li><code>target</code> - Output format: <code>clash</code> | <code>surge</code> | <code>json</code></li>
-    </ul>
-    
-    <h2>📝 Examples</h2>
-    
-    <div class="example">
-      <h4>Convert to Clash:</h4>
-      <code>https://your-worker.workers.dev/?url=https://example.com/sub&target=clash</code>
-    </div>
-    
-    <div class="example">
-      <h4>Convert to Surge:</h4>
-      <code>https://your-worker.workers.dev/?url=https://example.com/sub&target=surge</code>
-    </div>
-    
-    <div class="example">
-      <h4>Merge multiple subscriptions:</h4>
-      <code>https://your-worker.workers.dev/?url=SUB1&url=SUB2&target=clash</code>
-    </div>
-    
-    <div class="example">
-      <h4>Get JSON format (for debugging):</h4>
-      <code>https://your-worker.workers.dev/?url=https://example.com/sub&target=json</code>
-    </div>
-    
-    <div class="warning">
-      <h3>⚠️ Important Notes</h3>
-      <ul>
-        <li>Subscription URLs must be accessible from Cloudflare network</li>
-        <li>IPv6 nodes will be automatically labeled with <code>-v6</code> suffix</li>
-        <li>Results are cached for 1 hour for better performance</li>
-        <li>Maximum fetch timeout is 10 seconds per subscription</li>
-      </ul>
-    </div>
-    
-    <h2>🛠️ IPv6 Detection</h2>
-    <p>The converter automatically detects IPv6 addresses in proxy configurations and adds a <code>-v6</code> suffix to the node names. This helps identify which nodes use IPv6 connectivity.</p>
-    
-    <p style="margin-top: 30px; text-align: center; color: #666;">
-      Made with ❤️ | Powered by Cloudflare Workers
-    </p>
-  </div>
-</body>
-</html>`;
+    // Combine in priority order
+    return [
+      ...categorized.priorityRegions,
+      ...categorized.operatorIPs,
+      ...categorized.backupIPs
+    ];
+  } catch (error) {
+    console.error('Error fetching IPs:', error);
+    throw error;
+  }
 }
 
-// ==================== Worker Entry Point ====================
+/**
+ * Process individual IP entry
+ */
+function processIPEntry(entry) {
+  return {
+    name: entry.name || 'Unknown',
+    ip: entry.ip,
+    colo: entry.colo || 'Unknown',
+    latency: entry.latency || null,
+    speed: entry.speed || 0,
+    uptime: entry.uptime || '',
+    isIPv6: isIPv6Address(entry.ip),
+    operator: getOperatorCode(entry.name)
+  };
+}
 
-export default {
-  async fetch(request) {
-    return handleRequest(request);
+/**
+ * Categorize IPs into priority groups
+ */
+function categorizeIPs(ips) {
+  const categories = {
+    priorityRegions: [],
+    operatorIPs: [],
+    backupIPs: []
+  };
+  
+  for (const ip of ips) {
+    if (PRIORITY_REGIONS.includes(ip.colo)) {
+      categories.priorityRegions.push(ip);
+    } else if (ip.operator) {
+      categories.operatorIPs.push(ip);
+    } else {
+      categories.backupIPs.push(ip);
+    }
   }
-};
+  
+  return categories;
+}
+
+/**
+ * Compare function for sorting by performance
+ * Priority: latency (lower better) > speed (higher better)
+ * Handle null/missing latency gracefully
+ */
+function comparePerformance(a, b) {
+  // If both have latency, compare by latency first
+  if (a.latency !== null && b.latency !== null) {
+    if (a.latency !== b.latency) {
+      return a.latency - b.latency; // Lower latency is better
+    }
+    // If latency is equal, compare by speed
+    return b.speed - a.speed; // Higher speed is better
+  }
+  
+  // If only one has latency, prefer the one with latency
+  if (a.latency !== null) return -1;
+  if (b.latency !== null) return 1;
+  
+  // If neither has latency, compare by speed only
+  return b.speed - a.speed;
+}
+
+/**
+ * Check if address is IPv6
+ */
+function isIPv6Address(ip) {
+  return ip.includes(':');
+}
+
+/**
+ * Get operator code from name
+ */
+function getOperatorCode(name) {
+  return OPERATOR_MAP[name] || null;
+}
+
+/**
+ * Generate node name with proper formatting
+ */
+function generateNodeName(ip, protocol = 'WS') {
+  const prefix = 'Edgesky';
+  const regionCode = ip.colo;
+  const ipVersion = ip.isIPv6 ? 'v6' : 'v4';
+  const optimizedTag = PRIORITY_REGIONS.includes(ip.colo) ? 'Optimized' : '';
+  
+  // Examples: Edgesky-WS-HK-Optimized, Edgesky-gRPC-SG-v6
+  let nameParts = [prefix, protocol, regionCode];
+  
+  if (optimizedTag) {
+    nameParts.push(optimizedTag);
+  } else if (!ip.isIPv6) {
+    // Only add IP version tag for non-priority regions or IPv6
+    nameParts.push(ipVersion);
+  }
+  
+  if (ip.isIPv6 && !optimizedTag) {
+    nameParts.push(ipVersion);
+  }
+  
+  return nameParts.join('-');
+}
+
+/**
+ * Generate V2Ray subscription format (Base64 encoded vmess/vless links)
+ */
+function generateV2raySubscription(ips) {
+  const configs = ips.slice(0, 50).map((ip, index) => {
+    const config = {
+      v: '2',
+      ps: generateNodeName(ip, 'WS'),
+      add: ip.ip,
+      port: '443',
+      id: 'YOUR-UUID-HERE', // Replace with actual UUID
+      aid: '0',
+      net: 'ws',
+      type: 'none',
+      host: 'your-domain.com', // Replace with actual domain
+      path: '/ws',
+      tls: 'tls',
+      sni: 'your-domain.com'
+    };
+    
+    const vmessLink = 'vmess://' + btoa(JSON.stringify(config));
+    return vmessLink;
+  });
+  
+  return btoa(configs.join('\n'));
+}
+
+/**
+ * Generate Clash subscription format (YAML)
+ */
+function generateClashSubscription(ips) {
+  const proxies = ips.slice(0, 50).map((ip, index) => {
+    return `  - name: "${generateNodeName(ip, 'WS')}"
+    type: vmess
+    server: ${ip.ip}
+    port: 443
+    uuid: YOUR-UUID-HERE
+    alterId: 0
+    cipher: auto
+    tls: true
+    skip-cert-verify: false
+    servername: your-domain.com
+    network: ws
+    ws-opts:
+      path: /ws
+      headers:
+        Host: your-domain.com`;
+  });
+  
+  const proxyNames = ips.slice(0, 50).map(ip => `      - "${generateNodeName(ip, 'WS')}"`);
+  
+  return `# Edgesky Optimized Clash Configuration
+# Generated: ${new Date().toISOString()}
+
+proxies:
+${proxies.join('\n')}
+
+proxy-groups:
+  - name: "🚀 Proxy"
+    type: select
+    proxies:
+${proxyNames.join('\n')}
+  
+  - name: "♻️ Auto"
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+${proxyNames.join('\n')}
+  
+  - name: "🇭🇰 Hong Kong"
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+${ips.filter(ip => ip.colo === 'HKG').slice(0, 20).map(ip => `      - "${generateNodeName(ip, 'WS')}"`).join('\n')}
+  
+  - name: "🇸🇬 Singapore"
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+${ips.filter(ip => ip.colo === 'SIN').slice(0, 20).map(ip => `      - "${generateNodeName(ip, 'WS')}"`).join('\n')}
+
+rules:
+  - DOMAIN-SUFFIX,google.com,🚀 Proxy
+  - DOMAIN-KEYWORD,google,🚀 Proxy
+  - DOMAIN-SUFFIX,youtube.com,🚀 Proxy
+  - DOMAIN-SUFFIX,facebook.com,🚀 Proxy
+  - DOMAIN-SUFFIX,twitter.com,🚀 Proxy
+  - GEOIP,CN,DIRECT
+  - MATCH,🚀 Proxy`;
+}
+
+/**
+ * Generate Surge subscription format
+ */
+function generateSurgeSubscription(ips) {
+  const proxies = ips.slice(0, 50).map((ip, index) => {
+    const name = generateNodeName(ip, 'WS');
+    return `${name} = vmess, ${ip.ip}, 443, username=YOUR-UUID-HERE, ws=true, ws-path=/ws, ws-headers=Host:"your-domain.com", tls=true, sni=your-domain.com`;
+  });
+  
+  const proxyList = ips.slice(0, 50).map(ip => generateNodeName(ip, 'WS')).join(', ');
+  const hkProxies = ips.filter(ip => ip.colo === 'HKG').slice(0, 20).map(ip => generateNodeName(ip, 'WS')).join(', ');
+  const sgProxies = ips.filter(ip => ip.colo === 'SIN').slice(0, 20).map(ip => generateNodeName(ip, 'WS')).join(', ');
+  
+  return `#!MANAGED-CONFIG https://your-worker.workers.dev/?format=surge interval=86400 strict=true
+
+[General]
+loglevel = notify
+dns-server = 223.5.5.5, 114.114.114.114, system
+
+[Proxy]
+${proxies.join('\n')}
+
+[Proxy Group]
+🚀 Proxy = select, ${proxyList}
+♻️ Auto = url-test, ${proxyList}, url = http://www.gstatic.com/generate_204, interval = 300
+🇭🇰 Hong Kong = url-test, ${hkProxies}, url = http://www.gstatic.com/generate_204, interval = 300
+🇸🇬 Singapore = url-test, ${sgProxies}, url = http://www.gstatic.com/generate_204, interval = 300
+
+[Rule]
+DOMAIN-SUFFIX,google.com,🚀 Proxy
+DOMAIN-KEYWORD,google,🚀 Proxy
+DOMAIN-SUFFIX,youtube.com,🚀 Proxy
+DOMAIN-SUFFIX,facebook.com,🚀 Proxy
+DOMAIN-SUFFIX,twitter.com,🚀 Proxy
+GEOIP,CN,DIRECT
+FINAL,🚀 Proxy`;
+}
+
+/**
+ * Base64 encode function (for environments without btoa)
+ */
+function btoa(str) {
+  return Buffer.from(str).toString('base64');
+}
+
+/**
+ * Export for testing
+ */
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    getPreferredIps,
+    processIPEntry,
+    categorizeIPs,
+    comparePerformance,
+    generateNodeName,
+    isIPv6Address,
+    getOperatorCode
+  };
+}
