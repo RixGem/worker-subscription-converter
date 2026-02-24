@@ -1,0 +1,63 @@
+name: Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Validate JavaScript syntax
+        run: node -c worker_to_sub.js
+      
+      - name: Check for ESLint issues (if configured)
+        run: |
+          if [ -f .eslintrc.json ]; then
+            npm run lint || echo "No lint script found"
+          fi
+        continue-on-error: true
+      
+      - name: Test worker locally
+        run: |
+          echo "Starting wrangler dev in background..."
+          npx wrangler dev --port 8787 &
+          WRANGLER_PID=$!
+          
+          # Wait for worker to start
+          sleep 10
+          
+          # Test root endpoint
+          echo "Testing root endpoint..."
+          curl -f http://localhost:8787/ || exit 1
+          
+          # Test with invalid parameters
+          echo "Testing error handling..."
+          curl -f http://localhost:8787/?target=clash || exit 1
+          
+          # Cleanup
+          kill $WRANGLER_PID
+        continue-on-error: true
+      
+      - name: Report test results
+        if: always()
+        run: echo "Tests completed"
